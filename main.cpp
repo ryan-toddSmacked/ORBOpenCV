@@ -1,12 +1,3 @@
-/**
- * @file main.cpp
- * @author Ryan C Todd ryantodddev@gmail.com
- * @brief Application to extract and match features from images. Using OpenCV {ORB} and C++.
- * @version 0.1
- * @date 2023-11-15
- * 
- */
-
 
 // Opencv includes
 #include <opencv2/core.hpp>
