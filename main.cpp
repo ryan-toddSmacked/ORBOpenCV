@@ -1,373 +1,452 @@
 
-// Opencv includes
+#include <chrono>
+#include <iostream>
+#include <fstream>
+#include <thread>
+#include <vector>
+#include <string>
+#include <sstream>
+#include <iomanip>
+
+#include <opencv2/opencv.hpp>
 #include <opencv2/core.hpp>
 #include <opencv2/highgui.hpp>
 #include <opencv2/imgproc.hpp>
 #include <opencv2/features2d.hpp>
 #include <opencv2/calib3d.hpp>
 
-// Boost
 #include <boost/program_options.hpp>
 
-// C++ includes
-#include <iostream>
-#include <iomanip>
-#include <sstream>
-#include <fstream>
-#include <string>
-#include <vector>
-#include <thread>
-#include <chrono>
+#include <hdf5.h>
 
-struct OrbInput
+static bool verbose = false;
+static std::string input_file;
+static int num_threads;
+static int nfeatures;
+static double scale_factor;
+static int nlevels;
+static int edge_threshold;
+static int first_level;
+static int score_type;
+static int patch_size;
+static int fast_threshold;
+static double reproj_threshold;
+static int max_iters;
+static double confidence;
+static bool sort_matches;
+static double percent_matches;
+
+static cv::Ptr<cv::ORB> detector;
+static const cv::Ptr<cv::BFMatcher> matcher = cv::BFMatcher::create(cv::NORM_HAMMING, true);
+
+static std::mutex mutex;
+
+struct ORBWorker
 {
     std::string image1;
     std::string image2;
-    std::string homography;
+    std::string output;
 };
 
-// Orb parameters
-static int nfeatures;
-static float scaleFactor;
-static int nlevels;
-static int edgeThreshold;
-static int firstLevel;
-static int WTA_K;
-static cv::ORB::ScoreType scoreType;
-static int patchSize;
-static int fastThreshold;
+std::vector<ORBWorker> loadWorkers(const std::string& filename);
+std::vector<std::string> splitcommas(std::string& str);
+void ORBWorkerThread(const ORBWorker& worker);
+void writeResults(const std::string& im1, const std::string& im2, const cv::Mat& H, const std::string& output);
 
-// Split a string into a vector of strings
-std::vector<std::string> string_split(const std::string& str, const std::string& delim);
 
-// ORB function
-void orb(const OrbInput& input);
 
-// imadjust function
-void imadjust(cv::Mat& im1, cv::Mat& im2);
+const char about[] =
+    "This program uses Oriented FAST and Rotated BRIEF (ORB) to detect\n"
+    "keypoints and compute descriptors in two images, then matches the\n"
+    "descriptors using a Brute-Force matcher and finds a homography\n"
+    "matrix using RANSAC to align the images.\n"
+    "The homography matrix is written to an HDF5 file.\n";
 
-void loadProcesses(std::vector<OrbInput>& inputs, const std::string& input_file);
 
 int main(int argc, char** argv)
 {
-    // Usage ./ORBDetector [REQUIRED] -i <input_file> [OPTIONAL] --nfeatures <number_of_features> --scaleFactor <scale_factor> --nlevels <number_of_levels> --edgeThreshold <edge_threshold> --firstLevel <first_level> --WTA_K <WTA_K> --scoreType <score_type> --patchSize <patch_size> --fastThreshold <fast_threshold>
-    // The only required argument is the input file
-    // The rest of the arguments are optional and have default values
-    // The default values are the same as the default values for the ORB detector in OpenCV
 
-    // Create a program options object
-    boost::program_options::options_description desc("Allowed options");
+    // Parse command line arguments
+    namespace po = boost::program_options;
+    po::options_description desc("Options");
 
-    // Add the options
     desc.add_options()
-        ("help", "Produce help message")
-        ("inputFile", boost::program_options::value<std::string>(), "Input file")
-        ("nthreads", boost::program_options::value<int>()->default_value(1), "Number of threads")
-        ("nfeatures", boost::program_options::value<int>()->default_value(500), "Number of features")
-        ("scaleFactor", boost::program_options::value<float>()->default_value(1.2f), "Scale factor")
-        ("nlevels", boost::program_options::value<int>()->default_value(8), "Number of levels")
-        ("edgeThreshold", boost::program_options::value<int>()->default_value(31), "Edge threshold")
-        ("firstLevel", boost::program_options::value<int>()->default_value(0), "First level")
-        ("WTA_K", boost::program_options::value<int>()->default_value(2), "WTA_K, 2 or 3")
-        ("scoreType", boost::program_options::value<int>()->default_value(cv::ORB::HARRIS_SCORE), "Score type, 0 = HARRIS_SCORE, 1 = FAST_SCORE")
-        ("patchSize", boost::program_options::value<int>()->default_value(31), "Patch size")
-        ("fastThreshold", boost::program_options::value<int>()->default_value(20), "Fast threshold");
+        ("help", "Print help message")
+        ("verbose", "Print verbose messages")
+        ("input-file", po::value<std::string>(), "Input file containing images to process")
+        ("num-threads", po::value<int>()->default_value(1), "Number of parallel processes")
+        ("nfeatures", po::value<int>()->default_value(500), "Number of features to detect")
+        ("scale-factor", po::value<double>()->default_value(1.2), "Scale factor between levels in the scale pyramid")
+        ("nlevels", po::value<int>()->default_value(8), "Number of levels in the scale pyramid")
+        ("edge-threshold", po::value<int>()->default_value(31), "Size of the border where the features are not detected")
+        ("first-level", po::value<int>()->default_value(0), "First level to start the scale pyramid")
+        ("score-type", po::value<int>()->default_value(0), "Type of the score, 0=Harris, 1=FAST")
+        ("patch-size", po::value<int>()->default_value(31), "Size of the patch used by the oriented BRIEF descriptor")
+        ("fast-threshold", po::value<int>()->default_value(20), "Threshold for the FAST keypoint detector")
+        ("reproj-threshold", po::value<double>()->default_value(3.0), "Maximum allowed reprojection error to treat a point pair as an inlier for RANSAC")
+        ("max-iters", po::value<int>()->default_value(2000), "Maximum number of iterations to use for Homography generation")
+        ("confidence", po::value<double>()->default_value(0.995), "Confidence level, between 0 and 1, for the estimated homography")
+        ("sort-matches", po::value<bool>()->default_value(true), "Sort matches by distance")
+        ("percent-matches", po::value<double>()->default_value(10.0), "Percent of matches to use for homography generation, only used if sort-matches is true");
 
-    // Create a variables map
-    boost::program_options::variables_map vm;
+    po::variables_map vm;
+    po::store(po::parse_command_line(argc, argv, desc), vm);
+    po::notify(vm);
 
-    // Parse the command line arguments
-    boost::program_options::store(boost::program_options::parse_command_line(argc, argv, desc), vm);
-
-    // Notify the variables map
-    boost::program_options::notify(vm);
-
-    // Check if the help option was given
+    verbose = vm.count("verbose") > 0;
     if (vm.count("help"))
     {
-        std::cout << desc << "\n";
-        // Describe what should be in the input file
-        // The input file needs to be a text file with the following format
-        // image1.jpg, image2.jpg, image1_warped.jpg, image2_warped.jpg (optional) homograpy.txt
-        std::cout << "The input file needs to be a text file with the following format\n";
-        std::cout << "image1.jpg, image2.jpg, homograpy.txt\n";
-        std::cout << "The file can contain as many lines as you want, they all\n";
-        std::cout << "must contain 3 values that are comma seperated\n\n";
+        std::cout << about << std::endl;
+        std::cout << desc << std::endl;
         return 1;
     }
-
-    // Check if the input file was given
-    if (vm.count("inputFile") != 1)
+    if (!vm.count("input-file"))
     {
-        std::cout << desc << "\n";
-        std::cout << "There must be exactly one provided input file\n";
+        std::cout << "Input file not specified" << std::endl;
+        std::cout << desc << std::endl;
         return 1;
     }
 
-    // Get the input file
-    std::string inputFile = vm["inputFile"].as<std::string>();
-
-    // Open the input file
-    std::ifstream ifs(inputFile);
-
-    // Check if the file was opened
-    if (!ifs.is_open())
-    {
-        std::cout << "Could not open the input file\n";
-        return 1;
-    }
-
-    // Set the static variables
+    input_file = vm["input-file"].as<std::string>();
+    num_threads = vm["num-threads"].as<int>();
     nfeatures = vm["nfeatures"].as<int>();
-    scaleFactor = vm["scaleFactor"].as<float>();
+    scale_factor = vm["scale-factor"].as<double>();
     nlevels = vm["nlevels"].as<int>();
-    edgeThreshold = vm["edgeThreshold"].as<int>();
-    firstLevel = vm["firstLevel"].as<int>();
-    WTA_K = vm["WTA_K"].as<int>();
-    scoreType = (cv::ORB::ScoreType)vm["scoreType"].as<int>();
-    patchSize = vm["patchSize"].as<int>();
-    fastThreshold = vm["fastThreshold"].as<int>();
-    int nthreads = vm["nthreads"].as<int>();
+    edge_threshold = vm["edge-threshold"].as<int>();
+    first_level = vm["first-level"].as<int>();
+    score_type = vm["score-type"].as<int>();
+    patch_size = vm["patch-size"].as<int>();
+    fast_threshold = vm["fast-threshold"].as<int>();
+    reproj_threshold = vm["reproj-threshold"].as<double>();
+    max_iters = vm["max-iters"].as<int>();
+    confidence = vm["confidence"].as<double>();
+    sort_matches = vm["sort-matches"].as<bool>();
+    percent_matches = vm["percent-matches"].as<double>();
 
-    std::vector<OrbInput> inputs;
+    // Load images
+    std::vector<ORBWorker> workers = loadWorkers(input_file);
 
-    loadProcesses(inputs, inputFile);
-
-    if (nthreads > 1)
+    if (workers.empty())
     {
-        size_t threads_pushed_back = 0;
-        std::vector<std::thread> threads(nthreads);
-        size_t num_inputs = inputs.size();
-
-        auto start = std::chrono::high_resolution_clock::now();
-        for (size_t i = 0; i < num_inputs; i++)
-        {
-            if (threads_pushed_back < (size_t)nthreads)
-            {
-                threads[threads_pushed_back] = std::thread(orb, inputs[i]);
-                threads_pushed_back++;
-            }
-            else
-            {
-                for (size_t j = 0; j < threads_pushed_back; j++)
-                {
-                    threads[j].join();
-                }
-
-                threads_pushed_back = 0;
-                i--;
-            }
-        }
-
-        for (size_t j = 0; j < threads_pushed_back; j++)
-        {
-            threads[j].join();
-        }
-
-        auto end = std::chrono::high_resolution_clock::now();
-        std::chrono::duration<double> elapsed = end - start;
-        std::cout << "Elapsed time: " << elapsed.count() << " seconds\n";
-        std::cout << "Average time: " << elapsed.count() / (double)num_inputs << " seconds\n";
+        std::cerr << "No images to process" << std::endl;
+        return 1;
     }
-    else
+
+    std::vector<std::thread> threads(num_threads);
+    int threads_working = 0;
+    detector = cv::ORB::create(nfeatures, scale_factor, nlevels, edge_threshold, first_level, 2, (cv::ORB::ScoreType)score_type, patch_size, fast_threshold);
+    
+    for (size_t i = 0; i < workers.size(); ++i)
     {
-        auto start = std::chrono::high_resolution_clock::now();
-        for (size_t i = 0; i < inputs.size(); i++)
-            orb(inputs[i]);
-        auto end = std::chrono::high_resolution_clock::now();
-        std::chrono::duration<double> elapsed = end - start;
-        std::cout << "Elapsed time: " << elapsed.count() << " seconds\n";
-        std::cout << "Average time: " << elapsed.count() / (double)inputs.size() << " seconds\n";
+        if (threads_working == num_threads)
+        {
+            for (size_t j = 0; j < threads.size(); ++j)
+            {
+                threads[j].join();
+            }
+            threads_working = 0;
+        }
+
+        threads[threads_working] = std::thread(ORBWorkerThread, workers[i]);
+        threads_working++;
+    }
+
+    for (int i = 0; i < threads_working; ++i)
+    {
+        threads[i].join();
     }
 
     return 0;
 }
 
-
-void loadProcesses(std::vector<OrbInput>& inputs, const std::string& input_file)
+std::vector<std::string> splitcommas(std::string& str)
 {
-    OrbInput input;
-
-    // Open the input file
-    std::ifstream ifs(input_file);
-
-    if (!ifs.is_open())
-    {
-        std::cout << "Could not open the input file\n";
-        return;
-    }
-
-    // Create a string to hold each line
-    std::string line;
-
-    // Create a vector of strings to hold the split line
-    std::vector<std::string> split_line;
-
-    // Read the file line by line
-    while (std::getline(ifs, line))
-    {
-        // Split the line
-        split_line = string_split(line, ",");
-
-        // Check if the line has at least 4 values
-        if (split_line.size() != 3)
-        {
-            continue;
-        }
-
-        // Set the input values
-        input.image1 = split_line[0];
-        input.image2 = split_line[1];
-        input.homography = split_line[2];
-
-        // Add the input to the vector
-        inputs.push_back(input);
-    }
-}
-
-std::vector<std::string> string_split(const std::string& str, const std::string& delim)
-{
-    // Create a vector of strings
-    std::vector<std::string> tokens;
-
-    size_t pos = 0;
-    size_t prev = 0;
+    std::vector<std::string> result;
     std::string token;
 
-    // Loop through the string
-    while ((pos = str.find(delim, prev)) != std::string::npos)
+    while (str.size() > 0)
     {
-        token = str.substr(prev, pos - prev);
-        // Remove leading and trailing whitespace
-        token.erase(0, token.find_first_not_of(' '));
-        token.erase(token.find_last_not_of(' ') + 1);
-        tokens.push_back(token);
-
-        prev = pos + delim.length();
-    }
-
-    // If the prev is not the end of the string
-    // then add the last token
-    if (prev < str.length())
-    {
-        token = str.substr(prev, std::string::npos);
-        // Remove leading and trailing whitespace
-        token.erase(0, token.find_first_not_of(' '));
-        token.erase(token.find_last_not_of(' ') + 1);
-        tokens.push_back(token);
-    }
-
-    return tokens;
-}
-
-void orb(const OrbInput& input)
-{
-    // Read the images as 32 bit floats and single channel
-    cv::Mat image1 = cv::imread(input.image1, cv::IMREAD_GRAYSCALE);
-    cv::Mat image2 = cv::imread(input.image2, cv::IMREAD_GRAYSCALE);
-
-    // Check if the images were read
-    if (image1.empty() || image2.empty())
-    {
-        std::cout << "Could not read the images\n";
-        return;
-    }
-
-    // Adjust the images
-    imadjust(image1, image2);
-
-    // Create the ORB detector
-    cv::Ptr<cv::ORB> orb = cv::ORB::create(nfeatures, scaleFactor, nlevels, edgeThreshold, firstLevel, WTA_K, scoreType, patchSize, fastThreshold);
-
-    //cv::Ptr<cv::AKAZE> orb = cv::AKAZE::create();
-
-    //cv::Ptr<cv::SIFT> orb = cv::SIFT::create();
-
-    // Create the keypoint vectors
-    std::vector<cv::KeyPoint> keypoints1, keypoints2;
-    keypoints1.reserve(nfeatures);
-    keypoints2.reserve(nfeatures);
-
-    // Create the descriptors
-    cv::Mat descriptors1, descriptors2;
-    descriptors1.reserve(nfeatures);
-    descriptors2.reserve(nfeatures);
-
-    // Create the matcher
-    cv::BFMatcher matcher(cv::NORM_HAMMING);
-
-    // Calculate the keypoints and descriptors
-    orb->detectAndCompute(image1, cv::noArray(), keypoints1, descriptors1);
-    orb->detectAndCompute(image2, cv::noArray(), keypoints2, descriptors2);
-
-    // Match the descriptors
-    std::vector<cv::DMatch> matches;
-    matches.reserve(nfeatures);
-    matcher.match(descriptors1, descriptors2, matches);
-
-    // std::sort
-    std::sort(matches.begin(), matches.end());
-
-    // Extract the top 20% of the matches
-    const size_t best_20_cutoff = (size_t)((float)matches.size() * 0.2f);
-    std::vector<cv::Point2f> src_pts(best_20_cutoff), dst_pts(best_20_cutoff);
-
-    for (size_t i = 0; i < best_20_cutoff; ++i)
-    {
-        src_pts[i] = keypoints1[matches[i].queryIdx].pt;
-        dst_pts[i] = keypoints2[matches[i].trainIdx].pt;
-    }
-
-    // Calculate the homography
-    const cv::Mat H = cv::findHomography(src_pts, dst_pts, cv::RANSAC);
-
-    // Check if the homography file was given
-    if (!input.homography.empty())
-    {
-        // Write the homography to a file
-        std::ofstream ofs(input.homography);
-
-        if (ofs.is_open())
+        size_t pos = str.find_first_of(',');
+        if (pos == std::string::npos)
         {
-            // Write image1 string to file
-            ofs << input.image1 << "\n";
-
-            // Write image2 string to file
-            ofs << input.image2 << "\n";
-
-            // Write the homography to the file
-            // Precision of 16 digits, row major, space seperated
-            ofs << std::setprecision(16) << H.at<double>(0, 0) << " " << H.at<double>(0, 1) << " " << H.at<double>(0, 2) << "\n";
-            ofs << std::setprecision(16) << H.at<double>(1, 0) << " " << H.at<double>(1, 1) << " " << H.at<double>(1, 2) << "\n";
-            ofs << std::setprecision(16) << H.at<double>(2, 0) << " " << H.at<double>(2, 1) << " " << H.at<double>(2, 2);
-
-            // Close the file
-            ofs.close();
+            token = str;
+            str.clear();
         }
         else
         {
-            std::cout << "Could not open the homography file: " << input.homography << "\n";
+            token = str.substr(0, pos);
+            str.erase(0, pos + 1);
         }
+        // Remove leading and trailing whitespace
+        token.erase(0, token.find_first_not_of(" \t\n\r\f\v"));
+        token.erase(token.find_last_not_of(" \t\n\r\f\v") + 1);
+        result.push_back(token);
     }
+
+    return result;
 }
 
-void imadjust(cv::Mat& im1, cv::Mat& im2)
+std::vector<ORBWorker> loadWorkers(const std::string& filename)
 {
-    // Convert images to 32 bit single channel floats
-    im1.convertTo(im1, CV_32FC1);
-    im2.convertTo(im2, CV_32FC1);
+    // Open the file for reading
+    std::ifstream file(filename);
+    std::vector<ORBWorker> workers;
 
-    // Get the mean of the first image
-    const float mean1 = cv::mean(im1)[0];
+    if (!file.is_open())
+    {
+        std::cerr << "Failed to open file: " << filename << std::endl;
+        return workers;
+    }
 
-    im1 = 32.0f * im1 / mean1;
-    im2 = 32.0f * im2 / mean1;
+    std::string line;
+    while (std::getline(file, line))
+    {
+        // Skip empty lines
+        if (line.empty())
+            continue;
 
-    // Set all values greater than 255 to 255
-    im1.setTo(255.0f, im1 > 255.0f);
-    im2.setTo(255.0f, im2 > 255.0f);
+        // Skip comment lines
+        if (line[0] == '#')
+            continue;
 
-    // Convert to single channel 8 bit unsigned integers
-    im1.convertTo(im1, CV_8UC1);
-    im2.convertTo(im2, CV_8UC1);
+        // Split the line into tokens
+        std::vector<std::string> tokens = splitcommas(line);
+
+        // Skip lines with less than 3 tokens
+        if (tokens.size() < 3)
+            continue;
+
+        // Create a worker
+        ORBWorker worker;
+        worker.image1 = tokens[0];
+        worker.image2 = tokens[1];
+        worker.output = tokens[2];
+
+        // Add the worker to the list
+        workers.push_back(worker);
+    }
+
+    return workers;
+}
+
+void writeResults(const std::string& im1, const std::string& im2, const cv::Mat& H, const std::string& output)
+{
+    const char* output_file = output.c_str();
+    const char* image1 = im1.c_str();
+    const char* image2 = im2.c_str();
+
+    // Write results to HDF5 file
+    hid_t file_id = H5Fcreate(output_file, H5F_ACC_TRUNC, H5P_DEFAULT, H5P_DEFAULT);
+
+    // Write image names as variable length strings
+    hid_t string_type = H5Tcopy(H5T_C_S1);
+    H5Tset_size(string_type, H5T_VARIABLE);
+
+    hid_t dataspace = H5Screate(H5S_SCALAR);
+    hid_t dataset = H5Dcreate(file_id, "image1", string_type, dataspace, H5P_DEFAULT, H5P_DEFAULT, H5P_DEFAULT);
+    H5Dwrite(dataset, string_type, H5S_ALL, H5S_ALL, H5P_DEFAULT, &image1);
+    H5Dclose(dataset);
+
+    dataset = H5Dcreate(file_id, "image2", string_type, dataspace, H5P_DEFAULT, H5P_DEFAULT, H5P_DEFAULT);
+    H5Dwrite(dataset, string_type, H5S_ALL, H5S_ALL, H5P_DEFAULT, &image2);
+    H5Dclose(dataset);
+    H5Sclose(dataspace);
+
+    // Write homography matrix, 3x3 double
+    hsize_t dims[2] = {3, 3};
+    dataspace = H5Screate_simple(2, dims, NULL);
+    dataset = H5Dcreate(file_id, "homography", H5T_NATIVE_DOUBLE, dataspace, H5P_DEFAULT, H5P_DEFAULT, H5P_DEFAULT);
+    H5Dwrite(dataset, H5T_NATIVE_DOUBLE, H5S_ALL, H5S_ALL, H5P_DEFAULT, H.data);
+    H5Dclose(dataset);
+    H5Sclose(dataspace);
+
+    H5Fclose(file_id);
+}
+
+void ORBWorkerThread(const ORBWorker& worker)
+{
+    // Load images
+    if (verbose)
+    {
+        std::chrono::high_resolution_clock::time_point t1, t2;
+        double elapsed_time;
+        std::stringstream ss;
+
+        ss << "\n";
+        ss << "============================================================\n";
+        ss << "ORB Processing images: \n";
+        ss << "    Input  -> " << worker.image1 << "\n";
+        ss << "    Input  -> " << worker.image2 << "\n";
+        ss << "    Output -> " << worker.output << "\n\n";
+
+        cv::Mat image1, image2;
+
+        t1 = std::chrono::high_resolution_clock::now();
+        cv::equalizeHist(cv::imread(worker.image1, cv::IMREAD_GRAYSCALE), image1);
+        cv::equalizeHist(cv::imread(worker.image2, cv::IMREAD_GRAYSCALE), image2);
+        t2 = std::chrono::high_resolution_clock::now();
+
+        if (image1.empty())
+        {
+            ss << "Failed to load image: " << worker.image1 << "\n";
+            ss << "Skipping...\n";
+            ss << "============================================================\n";
+            mutex.lock();
+            std::cout << ss.str();
+            mutex.unlock();
+            return;
+        }
+        if (image2.empty())
+        {
+            ss << "Failed to load image: " << worker.image2 << "\n";
+            ss << "Skipping...\n";
+            ss << "============================================================\n";
+            mutex.lock();
+            std::cout << ss.str();
+            mutex.unlock();
+            return;
+        }
+
+        // Get elapsed time as a double in seconds
+        elapsed_time = std::chrono::duration_cast<std::chrono::duration<double>>(t2 - t1).count();
+        ss << "Loaded images:         " << elapsed_time << " [s]\n";
+
+        // Detect keypoints and compute descriptors
+        std::vector<cv::KeyPoint> keypoints1, keypoints2;
+        cv::Mat descriptors1, descriptors2;
+
+        // Detect keypoints
+        t1 = std::chrono::high_resolution_clock::now();
+        detector->detect(image1, keypoints1);
+        detector->detect(image2, keypoints2);
+        t2 = std::chrono::high_resolution_clock::now();
+
+        // Get elapsed time as a double in seconds
+        elapsed_time = std::chrono::duration_cast<std::chrono::duration<double>>(t2 - t1).count();
+        ss << "Detected keypoints:    " << elapsed_time << " [s]\n";
+
+        // Compute descriptors
+        t1 = std::chrono::high_resolution_clock::now();
+        detector->compute(image1, keypoints1, descriptors1);
+        detector->compute(image2, keypoints2, descriptors2);
+        t2 = std::chrono::high_resolution_clock::now();
+
+        // Get elapsed time as a double in seconds
+        elapsed_time = std::chrono::duration_cast<std::chrono::duration<double>>(t2 - t1).count();
+        ss << "Computed descriptors:  " << elapsed_time << " [s]\n";
+
+        // Match descriptors
+        std::vector<cv::DMatch> matches;
+        
+        t1 = std::chrono::high_resolution_clock::now();
+        matcher->match(descriptors1, descriptors2, matches);
+        t2 = std::chrono::high_resolution_clock::now();
+
+        // Get elapsed time as a double in seconds
+        elapsed_time = std::chrono::duration_cast<std::chrono::duration<double>>(t2 - t1).count();
+        ss << "Matched descriptors:   " << elapsed_time << " [s]\n";
+
+        // Sort matches by distance
+        size_t num_matches = matches.size();
+        if (sort_matches)
+        {
+            t1 = std::chrono::high_resolution_clock::now();
+            std::sort(matches.begin(), matches.end());
+
+            // keep only the top matches
+            num_matches = matches.size() * (1.0 - percent_matches/100.0);
+            t2 = std::chrono::high_resolution_clock::now();
+
+            // Get elapsed time as a double in seconds
+            elapsed_time = std::chrono::duration_cast<std::chrono::duration<double>>(t2 - t1).count();
+            ss << "Sorted matches:        " << elapsed_time << " [s]\n";
+        }
+
+        // Convert keypoints to points
+        std::vector<cv::Point2f> points1(num_matches);
+        std::vector<cv::Point2f> points2(num_matches);
+
+        for (size_t i = 0; i < num_matches; ++i)
+        {
+            points1[i] = keypoints1[matches[i].queryIdx].pt;
+            points2[i] = keypoints2[matches[i].trainIdx].pt;
+        }
+
+        // Find homography
+        cv::Mat H;
+
+        t1 = std::chrono::high_resolution_clock::now();
+        H = cv::findHomography(points1, points2, cv::RANSAC, reproj_threshold, cv::noArray(), max_iters, confidence);
+        t2 = std::chrono::high_resolution_clock::now();
+
+        // Get elapsed time as a double in seconds
+        elapsed_time = std::chrono::duration_cast<std::chrono::duration<double>>(t2 - t1).count();
+        ss << "Found homography:      " << elapsed_time << " [s]\n";
+
+        // Write results
+        // hdf5 does not like multiple threads
+        mutex.lock();
+        t1 = std::chrono::high_resolution_clock::now();
+        writeResults(worker.image1, worker.image2, H, worker.output);
+        t2 = std::chrono::high_resolution_clock::now();
+        mutex.unlock();
+
+        // Get elapsed time as a double in seconds
+        elapsed_time = std::chrono::duration_cast<std::chrono::duration<double>>(t2 - t1).count();
+        ss << "Wrote results:         " << elapsed_time << " [s]\n";
+
+        ss << "============================================================\n";
+        mutex.lock();
+        std::cout << ss.str();
+        mutex.unlock();
+    }
+    else
+    {
+        cv::Mat image1, image2;
+
+        cv::equalizeHist(cv::imread(worker.image1, cv::IMREAD_GRAYSCALE), image1);
+        cv::equalizeHist(cv::imread(worker.image2, cv::IMREAD_GRAYSCALE), image2);
+
+        // Detect keypoints and compute descriptors
+        std::vector<cv::KeyPoint> keypoints1, keypoints2;
+        cv::Mat descriptors1, descriptors2;
+
+        detector->detectAndCompute(image1, cv::Mat(), keypoints1, descriptors1);
+        detector->detectAndCompute(image2, cv::Mat(), keypoints2, descriptors2);
+
+        // Match descriptors
+        std::vector<cv::DMatch> matches;
+
+        matcher->match(descriptors1, descriptors2, matches);
+
+        // Sort matches by distance
+        size_t num_matches = matches.size();
+        if (sort_matches)
+        {
+            std::sort(matches.begin(), matches.end());
+
+            // keep only the top matches
+            num_matches = matches.size() * (1.0 - percent_matches/100.0);
+        }
+
+        // Convert keypoints to points
+        std::vector<cv::Point2f> points1(num_matches);
+        std::vector<cv::Point2f> points2(num_matches);
+
+        for (size_t i = 0; i < num_matches; ++i)
+        {
+            points1[i] = keypoints1[matches[i].queryIdx].pt;
+            points2[i] = keypoints2[matches[i].trainIdx].pt;
+        }
+
+        // Find homography
+        cv::Mat H = cv::findHomography(points1, points2, cv::RANSAC, reproj_threshold, cv::noArray(), max_iters, confidence);
+
+        // Write results
+        // hdf5 does not like multiple threads
+        mutex.lock();
+        writeResults(worker.image1, worker.image2, H, worker.output);
+        mutex.unlock();
+    }
+    
 }
